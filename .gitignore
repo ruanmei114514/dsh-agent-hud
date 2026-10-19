@@ -1,0 +1,6 @@
+# local test artifacts / caches
+.pwcache/
+.playwright-cli/
+.pwcookie
+*.log
+node_modules/

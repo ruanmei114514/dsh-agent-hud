@@ -1,0 +1,20 @@
+# @local/agent-hud —— 贴 DSH 窗口边缘的用量悬浮条（Agent HUD 简约形态移植）
+#
+# 可调 config（改后重启生效）：
+#   refreshMs               DSH 日志重算的最小间隔，毫秒，默认 1500（客户端每 2s 轮询，页面隐藏时暂停）
+#   balanceMinIntervalMs    两次余额接口调用之间的硬下限，毫秒，默认 15000
+#                           （实际节奏由客户端的"自动刷新 + 秒数"控制，默认 90 秒）
+#   dshBudgetTokens24h      DeepSeek Harness 环满额预算（24h tokens），默认 200000000
+#   labelHarness            第一块名称，默认 "DeepSeek Harness"
+#   labelBalance            第二块名称，默认 "DeepSeek"
+#   （低余额预警的开关和金额在余额面板里设置，以人民币计，存浏览器 localStorage）
+#   dshHome                 DSH 数据目录，默认 $DSH_HOME 或 ~/.dsh
+- insert:
+    - id: agent-hud
+      name: '@local/agent-hud'
+      config:
+        refreshMs: 1500
+        balanceMinIntervalMs: 15000
+        dshBudgetTokens24h: 200000000
+        labelHarness: DeepSeek Harness
+        labelBalance: DeepSeek

@@ -1,0 +1,4 @@
+{
+  "title": "Agent HUD",
+  "description": "Edge strip inside the DSH window: 24h token rings for DeepSeek & Codex, hover stats, click cards with burn rate and hourly bars, plus other sessions' approvals (allow/deny right in the HUD) and replies."
+}
