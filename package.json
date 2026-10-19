@@ -1,6 +1,7 @@
 {
   "name": "@local/agent-hud",
   "version": "0.2.1",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "main": "index.js",

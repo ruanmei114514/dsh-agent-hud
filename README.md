@@ -43,3 +43,10 @@
 - 没有 `DEEPSEEK_API_KEY` 时余额块显示 `—`，面板里给出原因，其余功能不受影响
 - 采集器按 `agents[]` 数组模块化，后续加 9router/其它服务商只需扩 `collect()`
 - HUD 不拦截外部 agent 的审批；答复只覆盖 DSH 自身会话
+
+## 许可
+
+[MIT](LICENSE)。
+
+交互形态参考了 [jazzenchen/agent-hud-open](https://github.com/jazzenchen/agent-hud-open)（Apache-2.0，macOS 原生版）
+与 bilibili 视频 BV1LEWA6cErt；本插件为独立的 DSH 实现，未复制其源码。
