@@ -39,8 +39,11 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  function addUsage(s, t, total, input, output, cache, sessionId, now) {
-    if (t >= now - DAY && t <= now && total > 0) {
+  function addUsage(s, t, total, input, output, cache, sessionId, now, since) {
+    // A reset clips the rolling 24h window to the reset instant, so the panel
+    // starts from zero and grows back into a normal 24h window.
+    const floor = Math.max(now - DAY, since || 0)
+    if (t >= floor && t <= now && total > 0) {
       s.tokens += total
       s.input += input
       s.output += output
@@ -49,7 +52,7 @@ export function apply(ctx, config = {}) {
       s.sessions.add(sessionId)
       const i = Math.min(23, Math.max(0, Math.floor((t - (now - DAY)) / HOUR)))
       s.buckets[i] += total
-    } else if (t >= now - 2 * DAY && t < now - DAY && total > 0) {
+    } else if (!since && t >= now - 2 * DAY && t < now - DAY && total > 0) {
       s.prev24h += total
     }
   }
@@ -73,7 +76,7 @@ export function apply(ctx, config = {}) {
     return entries
   }
 
-  function scanDsh(now) {
+  function scanDsh(now, since) {
     const s = freshStats()
     const root = path.join(cfg.dshHome, 'sessions')
     let workspaces
@@ -111,7 +114,7 @@ export function apply(ctx, config = {}) {
           fileCache.set(f, rec)
         }
         rec.seenAt = now
-        for (const e of rec.entries) addUsage(s, e[0], e[1], e[2], e[3], e[4], sd, now)
+        for (const e of rec.entries) addUsage(s, e[0], e[1], e[2], e[3], e[4], sd, now, since)
       }
     }
     for (const [p, r] of fileCache) if (now - r.seenAt > 2 * DAY) fileCache.delete(p)
@@ -120,11 +123,13 @@ export function apply(ctx, config = {}) {
 
   let dshCache = null
   let dshAt = 0
+  let dshSince = 0
 
-  function dshStats(now) {
-    if (dshCache && now - dshAt < cfg.dshMinMs) return dshCache
-    dshCache = scanDsh(now)
+  function dshStats(now, since) {
+    if (dshCache && since === dshSince && now - dshAt < cfg.dshMinMs) return dshCache
+    dshCache = scanDsh(now, since)
     dshAt = now
+    dshSince = since
     return dshCache
   }
 
@@ -200,7 +205,7 @@ export function apply(ctx, config = {}) {
 
   // ---- snapshot ------------------------------------------------------------
 
-  function packDsh(s) {
+  function packDsh(s, since) {
     return {
       id: 'dsh',
       label: cfg.labelHarness,
@@ -216,6 +221,8 @@ export function apply(ctx, config = {}) {
       sessions24h: s.sessions.size,
       budget: cfg.dshBudget,
       buckets: s.buckets,
+      // 0 = normal rolling 24h window; otherwise the client's reset instant.
+      statsSince: since || 0,
     }
   }
 
@@ -233,14 +240,16 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function collect(forceBalance) {
+  async function collect(forceBalance, since) {
     const now = Date.now()
-    const dsh = dshStats(now)
+    // A reset older than the rolling window no longer changes the stats.
+    const activeSince = since && since > now - DAY ? since : 0
+    const dsh = dshStats(now, activeSince)
     const bal = await readBalance(forceBalance)
     return {
-      v: '0.2.1',
+      v: '0.3.0',
       updatedAt: now,
-      agents: [packDsh(dsh), packBalance(bal)],
+      agents: [packDsh(dsh, activeSince), packBalance(bal)],
     }
   }
 
@@ -281,7 +290,12 @@ export function apply(ctx, config = {}) {
             // ?refresh=1 asks for a balance refetch (subject to the floor);
             // without it the balance is served from cache so that turning the
             // client's auto-refresh off really means "no automatic refresh".
-            const snap = await collect(url.searchParams.get('refresh') === '1')
+            // ?since=<ms> clips the token stats to that instant (stats reset).
+            const sinceRaw = Number(url.searchParams.get('since'))
+            const since = Number.isFinite(sinceRaw) && sinceRaw > 0
+              ? Math.min(sinceRaw, Date.now())
+              : 0
+            const snap = await collect(url.searchParams.get('refresh') === '1', since)
             res.writeHead(200, {
               'content-type': 'application/json; charset=utf-8',
               'cache-control': 'no-store',

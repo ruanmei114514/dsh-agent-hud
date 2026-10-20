@@ -1,4 +1,4 @@
 {
   "title": "Agent HUD 用量悬浮条",
-  "description": "贴在 DSH 窗口边缘的用量条：DeepSeek/Codex 24h Token 圆环，悬停看速率，点开看小时柱状图；并列出其他会话的待批准（可在 HUD 内直接同意/不同意）和新回复。"
+  "description": "贴在 DSH 窗口边缘的用量条：DeepSeek 24h Token 圆环、余额、峰谷价格时段倒计时，悬停看速率，点开看明细；并列出其他会话的待批准（可在 HUD 内直接同意/不同意）和新回复。"
 }

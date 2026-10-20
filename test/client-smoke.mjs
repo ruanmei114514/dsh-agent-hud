@@ -1,6 +1,7 @@
 // Minimal smoke check for the Client half: loads client.js under a mock module
 // loader + React stub, then asserts full-name chips, multi-panel ordering, the
-// working × button, the balance refresh controls, and degradation paths.
+// working × button, balance controls, the peak/off-peak countdown, stats reset,
+// and degradation paths.
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 
@@ -11,7 +12,7 @@ const SNAP = {
       id: 'dsh', label: 'DeepSeek Harness', kind: 'tokens', available: true,
       tokens24h: 147200000, input24h: 8500000, output24h: 980000, cache24h: 137000000,
       prev24h: 3400000, ratePerH: 27500000, calls24h: 1179, sessions24h: 37,
-      budget: 200000000, buckets: new Array(24).fill(5000000),
+      budget: 200000000, buckets: new Array(24).fill(5000000), statsSince: 0,
     },
     {
       id: 'deepseek', label: 'DeepSeek', kind: 'balance',
@@ -27,7 +28,12 @@ globalThis.window = { __ModuleLoader__: { load(mod) { factory = mod.factory } } 
 globalThis.location = {
   pathname: '/s/session-6d05b48e-ecf7-486a-9420-91107954d31a', search: '', hash: '',
 }
-globalThis.localStorage = { getItem: () => null, setItem: () => {} }
+const store = new Map()
+globalThis.localStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => { store.set(k, String(v)) },
+  removeItem: (k) => { store.delete(k) },
+}
 globalThis.document = {
   visibilityState: 'visible',
   addEventListener() {},
@@ -196,14 +202,14 @@ function findAll(node, pred, out = []) {
   console.log('ok: notices panel')
 }
 
-// 7) auto-refresh off means no balance interval, only the 2s DSH poll
+// 7) auto-refresh off means no balance interval, only the 2s DSH poll + 1s price clock
 {
   intervals = []
   render(SNAP, [], { auto: false, seconds: 90 })
-  assert.deepEqual(intervals, [2000], 'only the DSH poll runs when auto is off')
+  assert.deepEqual(intervals, [2000, 1000], 'DSH poll + price countdown when auto is off')
   intervals = []
   render(SNAP, [], { auto: true, seconds: 30 })
-  assert.deepEqual(intervals, [2000, 30000], 'DSH poll + balance poll when auto is on')
+  assert.deepEqual(intervals, [2000, 30000, 1000], 'DSH poll + balance poll + price countdown when auto is on')
   console.log('ok: auto-refresh toggle controls the balance interval')
 }
 
@@ -213,6 +219,72 @@ function findAll(node, pred, out = []) {
   assert.ok(s.includes('ahud-bar'), 'strip still renders')
   assert.ok(!s.includes('notices'), 'no bell without useSessionStatus')
   console.log('ok: degrade without framework props')
+}
+
+// 9) peak/off-peak chip + countdown against the Beijing schedule
+{
+  const realNow = Date.now
+  const check = (iso, peak, count) => {
+    Date.now = () => Date.parse(iso)
+    const s = flat(render(SNAP))
+    assert.ok(s.includes(peak ? 'peak fullPrice' : 'offPeak halfPrice'), iso + ': period')
+    assert.ok(s.includes(count + ' toSwitch'), iso + ': countdown ' + count)
+  }
+  check('2026-10-21T02:00:00Z', true, '2:00:00') // Wed 10:00 -> 12:00
+  check('2026-10-21T04:00:00Z', false, '2:00:00') // Wed 12:00 -> 14:00
+  check('2026-10-24T02:00:00Z', false, '47:00:00') // Sat 10:00 -> Mon 09:00
+  check('2026-10-23T10:00:00Z', false, '63:00:00') // Fri 18:00 -> Mon 09:00
+  check('2026-10-01T02:00:00Z', false, '167:00:00') // holiday Thu -> Oct 8 09:00
+  Date.now = realNow
+  console.log('ok: peak/off-peak chip + countdown')
+}
+
+// 9b) price panel: rule rows, source link, uncovered-year note
+{
+  const realNow = Date.now
+  Date.now = () => Date.parse('2027-01-04T02:00:00Z') // Mon 10:00, year not in the calendar
+  const s = flat(render(SNAP, ['pricing']))
+  assert.ok(s.includes('peakWindow') && s.includes('offPeakWindow'), 'rule rows')
+  assert.ok(s.includes('calendarNote'), 'uncovered year is called out')
+  assert.ok(s.includes('api-docs.deepseek.com'), 'source link')
+  Date.now = realNow
+  console.log('ok: pricing panel')
+}
+
+// 10) reset stats: a since= request, an undo control, and persistence
+{
+  const realNow = Date.now
+  const NOW = 1792390000000
+  Date.now = () => NOW
+  store.delete('agent-hud.reset.v1')
+  const tree = render(SNAP, ['dsh'])
+  const btn = findAll(tree, (n) => n.type === 'button' && (n.kids || []).includes('resetStats'))[0]
+  assert.ok(btn, 'reset button present')
+  assert.ok(!btn.props.disabled, 'reset enabled when the host advertises statsSince')
+  await btn.props.onClick()
+  assert.equal(hooks[8], NOW, 'reset state set to now')
+  assert.ok(fetched.some((u) => u.includes('since=' + NOW)), 'reset asks for a clipped window')
+
+  store.set('agent-hud.reset.v1', String(NOW))
+  const resetSnap = { ...SNAP, agents: [{ ...SNAP.agents[0], statsSince: NOW }, SNAP.agents[1]] }
+  const s = flat(render(resetSnap, ['dsh']))
+  assert.ok(s.includes('resetClear') && s.includes('since'), 'undo + since row shown')
+  const clear = findAll(render(resetSnap, ['dsh']), (n) => n.type === 'button' && (n.kids || []).includes('resetClear'))[0]
+  await clear.props.onClick()
+  assert.equal(hooks[8], 0, 'undo clears the reset state')
+  store.delete('agent-hud.reset.v1')
+  Date.now = realNow
+  console.log('ok: reset stats button')
+}
+
+// 10b) old host (no statsSince) disables the reset button instead of pretending
+{
+  const old = { ...SNAP, agents: [{ ...SNAP.agents[0] }, SNAP.agents[1]] }
+  delete old.agents[0].statsSince
+  const tree = render(old, ['dsh'])
+  const btn = findAll(tree, (n) => n.type === 'button' && (n.kids || []).includes('resetStats'))[0]
+  assert.ok(btn && btn.props.disabled, 'reset disabled until the host is restarted')
+  console.log('ok: reset degrades on an old host')
 }
 
 console.log('CLIENT SMOKE PASS')

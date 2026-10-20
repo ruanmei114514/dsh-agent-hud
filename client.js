@@ -1,10 +1,11 @@
 // Agent HUD — Client half: a screen-edge strip inside the DSH web page.
 // Renders one chip per agent from /agent-hud/state.json: the DSH token ring
-// (DeepSeek Harness, polled every 2s) and the DeepSeek API balance (polled on
-// its own schedule with ?refresh=1), plus live session notices (approval /
-// question / running / unread) read from the framework's useSessionStatus()
-// slot prop. Approvals use the same PendingApproval object as the conversation
-// card, so both views stay in sync automatically.
+// (DeepSeek Harness, polled every 2s), the DeepSeek API balance (polled on
+// its own schedule with ?refresh=1), and the current DeepSeek peak/off-peak
+// price period with a live countdown (computed locally), plus live session
+// notices (approval / question / running / unread) read from the framework's
+// useSessionStatus() slot prop. Approvals use the same PendingApproval object
+// as the conversation card, so both views stay in sync automatically.
 window.__ModuleLoader__.load({
   id: '@local/agent-hud',
   factory(require) {
@@ -16,7 +17,27 @@ window.__ModuleLoader__.load({
     const POS_KEY = 'agent-hud.pos.v1'
     const BAL_KEY = 'agent-hud.balance.v1'
     const WARN_KEY = 'agent-hud.warn.v1'
+    const RESET_KEY = 'agent-hud.reset.v1'
     const DSH_POLL_MS = 2000
+
+    // DeepSeek API peak/off-peak rule, per the official pricing page (checked
+    // 2026-10-20): peak is Beijing Mon–Fri 09:00–12:00 and 14:00–18:00,
+    // excluding Chinese statutory holidays; everything else (weekends and
+    // holidays all day) is off-peak at 50% of the peak price. China has no
+    // DST, so the fixed +08:00 offset is enough — no timezone library needed.
+    const BJ_OFFSET_MS = 8 * 3_600_000
+    const PRICE_DAY_MS = 86_400_000
+    const PEAK_WINDOWS = [[9 * 60, 12 * 60], [14 * 60, 18 * 60]]
+    const PRICE_CAL_YEAR = 2026
+    const HOLIDAYS_2026 = new Set([
+      '2026-01-01', '2026-01-02', // 元旦
+      '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-23', // 春节
+      '2026-04-06', // 清明
+      '2026-05-01', '2026-05-04', '2026-05-05', // 劳动节
+      '2026-06-19', // 端午
+      '2026-09-25', // 中秋
+      '2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07', // 国庆
+    ])
 
     const CSS = `
 .ahud-chip{display:flex;align-items:center;gap:5px;padding:2px 6px;border-radius:8px;cursor:pointer}
@@ -36,7 +57,7 @@ window.__ModuleLoader__.load({
 .ahud-item .nm{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ahud-kd{color:var(--dsw-alias-label-tertiary);white-space:nowrap}
 .ahud-err{color:var(--dsw-alias-state-error-primary);font-size:11px;padding-top:2px}
-.ahud-ctl{display:flex;align-items:center;gap:6px;margin-top:6px;color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap}
+.ahud-ctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap}
 .ahud-lbl{display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}
 .ahud-num{width:56px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-primary);padding:1px 4px;font-size:11px}
 .ahud-btn{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:6px;padding:1px 7px;font-size:11px;cursor:pointer}
@@ -44,6 +65,10 @@ window.__ModuleLoader__.load({
 .ahud-btn:disabled{opacity:.5;cursor:default}
 .ahud-btn.ok{color:var(--dsw-alias-state-success-primary)}
 .ahud-btn.deny{color:var(--dsw-alias-state-error-primary)}
+.ahud-price .ahud-name{font-variant-numeric:tabular-nums}
+.ahud-count{font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ahud-rule{padding:3px 0;border-top:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);line-height:1.5}
+.ahud-rule b{font-weight:600;color:var(--dsw-alias-label-primary);margin-right:4px}
 .ahud-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--dsw-alias-state-success-primary);animation:ahudpulse 1.2s ease-in-out infinite}
 .ahud-dot.st{animation:none}
 @keyframes ahudpulse{50%{opacity:.35}}
@@ -59,6 +84,14 @@ window.__ModuleLoader__.load({
         wallets: '钱包', updated: '更新于', warnOn: '低余额预警', yuan: '元',
         stale: '暂用上次数据', apiError: '错误', source: '来源',
         autoRefresh: '自动刷新', seconds: '秒', refreshNow: '立即刷新', refreshing: '刷新中…',
+        resetStats: '重置统计', resetClear: '恢复 24h', since: '统计自',
+        resetNeedsHost: '重启 DSH 后生效',
+        pricing: '价格时段', peak: '峰时', offPeak: '谷时', fullPrice: '原价', halfPrice: '5 折',
+        remaining: '剩余', toSwitch: '后切换', nextSwitch: '下次切换（本地时间）',
+        peakWindow: '工作日 09:00–12:00、14:00–18:00（北京时间）',
+        offPeakWindow: '其余时间（含周末、节假日）· 5 折',
+        calendarNote: '节假日按 2026 年日历；其他年份按工作日估算',
+        priceSource: 'DeepSeek 官方价格页',
       },
       en: {
         rate: 'rate', calls: 'calls', sessions: 'sessions', prev24: 'prev 24h', inOut: 'in/out',
@@ -69,6 +102,14 @@ window.__ModuleLoader__.load({
         wallets: 'wallets', updated: 'updated', warnOn: 'low balance alert', yuan: 'CNY',
         stale: 'showing last known', apiError: 'error', source: 'source',
         autoRefresh: 'auto refresh', seconds: 's', refreshNow: 'Refresh now', refreshing: 'refreshing…',
+        resetStats: 'Reset stats', resetClear: 'Restore 24h', since: 'counting since',
+        resetNeedsHost: 'restart DSH to enable',
+        pricing: 'Pricing', peak: 'Peak', offPeak: 'Off-peak', fullPrice: 'full price', halfPrice: '50% off',
+        remaining: 'remaining', toSwitch: 'to switch', nextSwitch: 'next switch (local)',
+        peakWindow: 'Mon–Fri 09:00–12:00, 14:00–18:00 (Beijing)',
+        offPeakWindow: 'all other times (weekends & holidays) · 50% off',
+        calendarNote: 'Holidays per the 2026 calendar; other years assume weekdays',
+        priceSource: 'DeepSeek official pricing',
       },
     }
 
@@ -102,6 +143,14 @@ window.__ModuleLoader__.load({
         }
       } catch {}
       return { on: true, amount: 20 }
+    }
+
+    function loadReset() {
+      try {
+        const at = Number(localStorage.getItem(RESET_KEY))
+        if (Number.isFinite(at) && at > 0) return Math.min(at, Date.now())
+      } catch {}
+      return 0
     }
 
     function fmtTok(n) {
@@ -141,6 +190,81 @@ window.__ModuleLoader__.load({
       } catch {
         return '—'
       }
+    }
+
+    function pad2(n) {
+      return n < 10 ? '0' + n : String(n)
+    }
+
+    // Beijing wall clock for an instant, plus the instant of that day's 00:00.
+    function bjClock(ms) {
+      const d = new Date(ms + BJ_OFFSET_MS)
+      const year = d.getUTCFullYear()
+      const month = d.getUTCMonth() + 1
+      const day = d.getUTCDate()
+      return {
+        year,
+        weekday: d.getUTCDay(), // 0 = Sunday
+        minute: d.getUTCHours() * 60 + d.getUTCMinutes(),
+        dateKey: year + '-' + pad2(month) + '-' + pad2(day),
+        dayStartMs: Date.UTC(year, month - 1, day) - BJ_OFFSET_MS,
+      }
+    }
+
+    function isPeakParts(p) {
+      if (p.weekday === 0 || p.weekday === 6) return false
+      if (p.year === PRICE_CAL_YEAR && HOLIDAYS_2026.has(p.dateKey)) return false
+      return PEAK_WINDOWS.some(([start, end]) => p.minute >= start && p.minute < end)
+    }
+
+    function isPeakAt(ms) {
+      return isPeakParts(bjClock(ms))
+    }
+
+    // Period, countdown to the next flip, and whether the holiday calendar
+    // covers the current year. Windows are half-open, so a boundary already
+    // belongs to the new period.
+    function pricingAt(ms) {
+      const p = bjClock(ms)
+      const peak = isPeakParts(p)
+      let next = null
+      // A long holiday can push the next flip more than a week out; 12 days
+      // covers the National Day block plus its surrounding weekend.
+      for (let day = 0; day < 12 && next === null; day++) {
+        for (const [start, end] of PEAK_WINDOWS) {
+          for (const minute of [start, end]) {
+            const at = p.dayStartMs + day * PRICE_DAY_MS + minute * 60_000
+            if (at > ms && isPeakAt(at) !== peak) {
+              next = at
+              break
+            }
+          }
+          if (next !== null) break
+        }
+      }
+      return {
+        peak,
+        next,
+        left: next === null ? 0 : Math.max(0, next - ms),
+        covered: p.year === PRICE_CAL_YEAR,
+      }
+    }
+
+    function fmtCountdown(ms) {
+      const total = Math.max(0, Math.ceil(ms / 1000))
+      const hours = Math.floor(total / 3600)
+      const minutes = Math.floor((total % 3600) / 60)
+      const seconds = total % 60
+      return hours > 0
+        ? hours + ':' + pad2(minutes) + ':' + pad2(seconds)
+        : minutes + ':' + pad2(seconds)
+    }
+
+    // Switch time in the viewer's own clock (the schedule itself is Beijing).
+    function fmtSwitch(at) {
+      if (!at) return '—'
+      const d = new Date(at)
+      return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes())
     }
 
     function tokenRing(a) {
@@ -202,6 +326,8 @@ window.__ModuleLoader__.load({
       const [balCfg, setBalCfg] = useState(loadBalCfg)
       const [warnCfg, setWarnCfg] = useState(loadWarnCfg)
       const [busy, setBusy] = useState(false)
+      const [now, setNow] = useState(() => Date.now())
+      const [resetAt, setResetAt] = useState(loadReset)
       const drag = useRef(null)
       const useStatus = props.useSessionStatus
       // Official callers always pass an explicit selector (the zero-arg path
@@ -214,13 +340,23 @@ window.__ModuleLoader__.load({
         if (j && Array.isArray(j.agents)) setSnap(j)
       }
 
+      // Every snapshot request carries the reset instant, so a balance poll
+      // cannot overwrite the clipped token stats with an unclipped copy.
+      const apiUrl = (refresh, since = resetAt) => {
+        const q = new URLSearchParams()
+        if (refresh) q.set('refresh', '1')
+        if (since) q.set('since', String(since))
+        const qs = q.toString()
+        return '/agent-hud/state.json' + (qs ? '?' + qs : '')
+      }
+
       // DSH: real-time polling, paused while the page is hidden.
       useEffect(() => {
         let alive = true
         const tick = async () => {
           if (document.visibilityState === 'hidden') return
           try {
-            const r = await fetch('/agent-hud/state.json', { cache: 'no-store' })
+            const r = await fetch(apiUrl(false), { cache: 'no-store' })
             if (!r.ok) throw new Error(String(r.status))
             const j = await r.json()
             if (alive) applySnap(j)
@@ -239,7 +375,7 @@ window.__ModuleLoader__.load({
           clearInterval(id)
           document.removeEventListener('visibilitychange', onVis)
         }
-      }, [])
+      }, [resetAt])
 
       // Balance: forced refetch on the user's own schedule (and only then).
       useEffect(() => {
@@ -247,7 +383,7 @@ window.__ModuleLoader__.load({
         let alive = true
         const tick = async () => {
           try {
-            const r = await fetch('/agent-hud/state.json?refresh=1', { cache: 'no-store' })
+            const r = await fetch(apiUrl(true), { cache: 'no-store' })
             if (!r.ok) throw new Error(String(r.status))
             const j = await r.json()
             if (alive) applySnap(j)
@@ -260,7 +396,7 @@ window.__ModuleLoader__.load({
           alive = false
           clearInterval(id)
         }
-      }, [balCfg.auto, balCfg.seconds])
+      }, [balCfg.auto, balCfg.seconds, resetAt])
 
       useEffect(() => {
         try {
@@ -279,6 +415,24 @@ window.__ModuleLoader__.load({
           localStorage.setItem(BAL_KEY, JSON.stringify(balCfg))
         } catch {}
       }, [balCfg])
+
+      useEffect(() => {
+        try {
+          if (resetAt) localStorage.setItem(RESET_KEY, String(resetAt))
+          else localStorage.removeItem(RESET_KEY)
+        } catch {}
+      }, [resetAt])
+
+      // One-second clock for the price-period countdown; resync on return.
+      useEffect(() => {
+        const id = setInterval(() => setNow(Date.now()), 1000)
+        const onVis = () => setNow(Date.now())
+        document.addEventListener('visibilitychange', onVis)
+        return () => {
+          clearInterval(id)
+          document.removeEventListener('visibilitychange', onVis)
+        }
+      }, [])
 
       useEffect(() => {
         if (!useStatus) console.warn('[agent-hud] useSessionStatus unavailable; notices hidden')
@@ -307,6 +461,7 @@ window.__ModuleLoader__.load({
         notices.sort((x, y) => rank[x.kind] - rank[y.kind])
       }
       const alertCount = notices.filter((n) => n.kind !== 'running').length
+      const pricing = pricingAt(now)
 
       function titleOf(sid) {
         try {
@@ -348,12 +503,33 @@ window.__ModuleLoader__.load({
       const refreshNow = async () => {
         setBusy(true)
         try {
-          const r = await fetch('/agent-hud/state.json?refresh=1', { cache: 'no-store' })
+          const r = await fetch(apiUrl(true), { cache: 'no-store' })
           if (r.ok) applySnap(await r.json())
         } catch {
           /* keep the last snapshot */
         } finally {
           setBusy(false)
+        }
+      }
+
+      const resetStats = async () => {
+        const at = Date.now()
+        setResetAt(at)
+        try {
+          const r = await fetch(apiUrl(true, at), { cache: 'no-store' })
+          if (r.ok) applySnap(await r.json())
+        } catch {
+          /* keep the last snapshot */
+        }
+      }
+
+      const clearReset = async () => {
+        setResetAt(0)
+        try {
+          const r = await fetch(apiUrl(true, 0), { cache: 'no-store' })
+          if (r.ok) applySnap(await r.json())
+        } catch {
+          /* keep the last snapshot */
         }
       }
 
@@ -467,6 +643,8 @@ window.__ModuleLoader__.load({
         const pct = a.budget > 0 ? Math.min(1, a.tokens24h / a.budget) : 0
         const ring = tokenRing(a)
         const row = (k, v) => h('div', { className: 'ahud-row', key: k }, h('span', null, k), h('b', null, v))
+        const resetSupported = Object.prototype.hasOwnProperty.call(a, 'statsSince')
+        const resetActive = resetSupported && resetAt > 0 && now - resetAt < PRICE_DAY_MS
         return h('div', { className: 'ahud-panel ahud-nodrag', key: 'p-' + a.id },
           panelHead(a, fmtTok(a.tokens24h) + ' / 24h'),
           h('div', { className: 'ahud-track' }, h('div', {
@@ -482,7 +660,17 @@ window.__ModuleLoader__.load({
           row(t('sessions'), String(a.sessions24h)),
           row(t('inOut'), fmtTok(a.input24h) + ' / ' + fmtTok(a.output24h)),
           row(t('cache'), fmtTok(a.cache24h || 0)),
-          Spark(a))
+          Spark(a),
+          h('div', { className: 'ahud-ctl' },
+            h('button', {
+              className: 'ahud-btn',
+              disabled: !resetSupported,
+              title: resetSupported ? undefined : t('resetNeedsHost'),
+              onClick: resetStats,
+            }, t('resetStats')),
+            resetActive ? h('button', { className: 'ahud-btn', onClick: clearReset }, t('resetClear')) : null,
+            resetActive ? h('span', { className: 'ahud-kd' }, t('since') + ' ' + fmtTime(resetAt)) : null,
+            resetSupported ? null : h('span', { className: 'ahud-kd' }, t('resetNeedsHost'))))
       }
 
       const balancePanel = (a) => {
@@ -547,6 +735,49 @@ window.__ModuleLoader__.load({
             }, busy ? t('refreshing') : t('refreshNow'))))
       }
 
+      const priceColor = pricing.peak
+        ? 'var(--dsw-alias-state-warn-primary)'
+        : 'var(--dsw-alias-state-success-primary)'
+      const priceCount = pricing.next ? fmtCountdown(pricing.left) : '—'
+      const priceLabel = t(pricing.peak ? 'peak' : 'offPeak') + ' ' + t(pricing.peak ? 'fullPrice' : 'halfPrice')
+
+      const pricingChip = h('div', {
+        className: 'ahud-chip ahud-price ahud-nodrag', key: 'pricing',
+        title: priceLabel + ' · ' + t('remaining') + ' ' + priceCount + '\n' + t('peakWindow') + '\n' + t('offPeakWindow'),
+        onClick: () => togglePanel('pricing'),
+      },
+        h('span', { className: 'ahud-dot st', style: { background: priceColor } }),
+        h('span', { className: 'ahud-name', style: { color: priceColor } }, priceLabel),
+        h('span', { className: 'ahud-count' }, '· ' + priceCount + ' ' + t('toSwitch')))
+
+      const pricingPanel = () => h('div', { className: 'ahud-panel ahud-nodrag', key: 'p-pricing' },
+        h('div', { className: 'ahud-head' },
+          h('span', { className: 'ahud-big' }, t('pricing')),
+          h('span', { style: { color: priceColor } }, priceLabel),
+          h('span', {
+            className: 'ahud-x',
+            onClick: (e) => {
+              e.stopPropagation()
+              closePanel('pricing')
+            },
+          }, '×')),
+        h('div', { className: 'ahud-row' },
+          h('span', null, t('remaining')),
+          h('b', { style: { fontVariantNumeric: 'tabular-nums' } }, priceCount)),
+        h('div', { className: 'ahud-row' },
+          h('span', null, t('nextSwitch')),
+          h('b', null, fmtSwitch(pricing.next))),
+        h('div', { className: 'ahud-rule' }, h('b', null, t('peak')), t('peakWindow')),
+        h('div', { className: 'ahud-rule' }, h('b', null, t('offPeak')), t('offPeakWindow')),
+        pricing.covered ? null : h('div', { className: 'ahud-kd', style: { paddingTop: 4 } }, t('calendarNote')),
+        h('div', { className: 'ahud-kd', style: { paddingTop: 4 } },
+          h('a', {
+            href: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+            target: '_blank',
+            rel: 'noreferrer',
+            style: { color: 'var(--dsw-alias-brand-primary)' },
+          }, t('priceSource'))))
+
       const noticeChip = h('div', {
         className: 'ahud-chip ahud-nodrag', key: 'notices',
         onClick: () => togglePanel('notices'),
@@ -603,11 +834,12 @@ window.__ModuleLoader__.load({
         notices.length ? h('div', null, notices.map(noticeRow))
           : h('div', { className: 'ahud-kd' }, t('none')))
 
-      // Panels render in chip order (agents..., then notices), never in click order.
+      // Panels render in chip order (agents..., pricing, then notices), never in click order.
       const panelList = []
       for (const a of snap.agents) {
         if (openPanels.includes(a.id)) panelList.push(a.kind === 'balance' ? balancePanel(a) : tokenPanel(a))
       }
+      if (openPanels.includes('pricing')) panelList.push(pricingPanel())
       if (useStatus && openPanels.includes('notices')) panelList.push(noticePanel)
 
       const children = [h('style', { key: 's' }, CSS)]
@@ -618,6 +850,7 @@ window.__ModuleLoader__.load({
             onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp, onPointerCancel: onUp,
           },
             snap.agents.map(agentChip),
+            pricingChip,
             useStatus ? noticeChip : null),
           panelList.length ? h('div', { key: 'panels', className: 'ahud-panels', style: panelsStyle }, panelList) : null))
       return h('div', { className: 'ahud-root', style: outer }, children)
