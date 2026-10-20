@@ -448,9 +448,22 @@ window.__ModuleLoader__.load({
       } catch {}
 
       const notices = []
+      // Subagent sessions are framework plumbing, not conversations to attend:
+      // keep them out of the bell entirely (approvals included). Prefer the
+      // list metadata; fall back to id shape (subagents are bare uuids, user
+      // sessions are `session-<uuid>`) when the row has not arrived yet.
+      function isSubagent(sid) {
+        try {
+          const row = list && list.byId ? list.byId[sid] : null
+          if (row && (row.origin === 'subagent' || row.parentSessionId)) return true
+          if (row) return false
+        } catch {}
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sid))
+      }
       if (status && typeof status.forEach === 'function') {
         status.forEach((st, sid) => {
           if (curUuid && sid.includes(curUuid)) return
+          if (isSubagent(sid)) return
           const pi = st.pendingInteraction
           if (pi && pi.kind === 'approval') notices.push({ sid, kind: 'approval', pi })
           else if (pi) notices.push({ sid, kind: 'wait', pi })

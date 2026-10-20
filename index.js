@@ -39,7 +39,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  function addUsage(s, t, total, input, output, cache, sessionId, now, since) {
+  function addUsage(s, t, total, input, output, cache, sessionId, now, since, sub) {
     // A reset clips the rolling 24h window to the reset instant, so the panel
     // starts from zero and grows back into a normal 24h window.
     const floor = Math.max(now - DAY, since || 0)
@@ -49,7 +49,9 @@ export function apply(ctx, config = {}) {
       s.output += output
       s.cache += cache
       s.calls++
-      s.sessions.add(sessionId)
+      // Subagent sessions really spend tokens, but they are not a "session"
+      // the user opened: keep them out of the session count.
+      if (!sub) s.sessions.add(sessionId)
       const i = Math.min(23, Math.max(0, Math.floor((t - (now - DAY)) / HOUR)))
       s.buckets[i] += total
     } else if (!since && t >= now - 2 * DAY && t < now - DAY && total > 0) {
@@ -60,6 +62,20 @@ export function apply(ctx, config = {}) {
   function readEntries(f) {
     const text = decompressConcat(fs.readFileSync(f)).toString('utf8')
     const entries = []
+    // Line 0 of a real log is the {"type":"session"...} header; delegated
+    // children carry origin:"subagent" (and parentSession). No header, or a
+    // plain one, means a user-opened session.
+    let sub = false
+    const head = (text.split('\n', 1)[0] || '').trim()
+    if (head.charCodeAt(0) === 0x7b) {
+      // starts with '{'
+      try {
+        const h = JSON.parse(head)
+        if (h && h.type === 'session') sub = h.origin === 'subagent' || !!h.parentSession
+      } catch {
+        /* fall through: treat as a normal session */
+      }
+    }
     for (const line of text.split('\n')) {
       if (!line || line.indexOf('"assistant/message"') === -1) continue
       let d
@@ -73,7 +89,7 @@ export function apply(ctx, config = {}) {
       if (!u || !u.totalTokens) continue
       entries.push([d.time, u.totalTokens, u.inputTokens || 0, u.outputTokens || 0, u.cacheReadTokens || 0])
     }
-    return entries
+    return { entries, sub }
   }
 
   function scanDsh(now, since) {
@@ -96,6 +112,8 @@ export function apply(ctx, config = {}) {
       for (const sd of dirs) {
         // Session dirs are `session-<uuid>` in current builds, but legacy
         // installs used bare uuids — the file stat check below filters the rest.
+        // Subagent dirs are bare uuids too; they are told apart by the log
+        // header, not the name (see readEntries).
         const f = path.join(root, w, sd, 'session.v4.jsonl.zstd')
         let st
         try {
@@ -107,14 +125,15 @@ export function apply(ctx, config = {}) {
         let rec = fileCache.get(f)
         if (!rec || rec.size !== st.size || rec.mtimeMs !== st.mtimeMs) {
           try {
-            rec = { size: st.size, mtimeMs: st.mtimeMs, entries: readEntries(f) }
+            const parsed = readEntries(f)
+            rec = { size: st.size, mtimeMs: st.mtimeMs, entries: parsed.entries, sub: parsed.sub }
           } catch {
             continue
           }
           fileCache.set(f, rec)
         }
         rec.seenAt = now
-        for (const e of rec.entries) addUsage(s, e[0], e[1], e[2], e[3], e[4], sd, now, since)
+        for (const e of rec.entries) addUsage(s, e[0], e[1], e[2], e[3], e[4], sd, now, since, rec.sub)
       }
     }
     for (const [p, r] of fileCache) if (now - r.seenAt > 2 * DAY) fileCache.delete(p)
