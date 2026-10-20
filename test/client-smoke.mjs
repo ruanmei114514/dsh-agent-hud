@@ -90,13 +90,14 @@ const status = new Map([
 ])
 const props = { useSessionStatus: () => status, useSessions: () => ({ ids: [], byId: {}, projectionsBySession: {} }) }
 
-function render(snap, openPanels = [], balCfg = { auto: true, seconds: 90 }, withProps = props, warnCfg = { on: true, amount: 20 }) {
+function render(snap, openPanels = [], balCfg = { auto: true, seconds: 90 }, withProps = props, warnCfg = { on: true, amount: 20 }, dismissArg) {
   hooks = []
   idx = 0
   hooks[0] = snap
   hooks[3] = openPanels
   hooks[4] = balCfg
   hooks[5] = warnCfg
+  if (dismissArg !== undefined) hooks[9] = dismissArg
   return view(withProps)
 }
 
@@ -198,8 +199,95 @@ function findAll(node, pred, out = []) {
   const s = flat(render(SNAP, ['notices']))
   assert.ok(s.includes('approve') && s.includes('deny') && s.includes('jump'), 'approval buttons')
   assert.ok(s.includes('aaaa0000'), 'other session listed')
-  assert.ok(!s.includes(CUR), 'current session excluded')
+  assert.ok(s.includes('clearAll'), 'clear-all control present')
   console.log('ok: notices panel')
+}
+
+// 6b) the session you are looking at is not an outstanding action, but a
+// running session stays visible (running is ambient, not a demand)
+{
+  const tree = render(SNAP, ['notices'])
+  const rows = findAll(tree, (n) => n.props && String(n.props.className).includes('ahud-item'))
+  const rowText = (n) => flat(n)
+  const curRow = rows.find((n) => rowText(n).includes('6d05b48e'))
+  assert.ok(curRow, 'a running current session is still listed')
+  assert.ok(rowText(curRow).includes('running'), 'listed as running, not as pending')
+  // The current session in the fixture has an approval; it must not be listed.
+  const approvalRows = rows.filter((n) => rowText(n).includes('approve'))
+  assert.equal(approvalRows.length, 1, 'only the other session carries the approval')
+  assert.ok(!rowText(approvalRows[0]).includes('6d05b48e'), 'current session has no approval row')
+  console.log('ok: current session filtered by kind, not by URL')
+}
+
+// 6c) a dismissed row leaves the bell, and a newer completion brings it back
+{
+  store.delete('agent-hud.dismiss.v1')
+  const stamp = 1792390000000
+  const unreadStatus = new Map([[UNREAD, { running: false, completionUnread: true, completionAt: stamp }]])
+  const withProps2 = { useSessionStatus: () => unreadStatus, useSessions: () => ({ ids: [], byId: {}, projectionsBySession: {} }) }
+  assert.ok(flat(render(SNAP, ['notices'], undefined, withProps2)).includes('bbbb0000'), 'unread listed first')
+
+  const tree = render(SNAP, ['notices'], undefined, withProps2)
+  const xs = findAll(tree, (n) => n.props && n.props.className === 'ahud-xrow')
+  assert.equal(xs.length, 1, 'exactly one dismiss control')
+  assert.equal(xs[0].props.title, 'dismiss')
+  xs[0].props.onClick({ stopPropagation() {} })
+  assert.equal(hooks[9][UNREAD], stamp, 'dismiss records the completion stamp')
+
+  // Rendered again with the same completion: the row stays gone.
+  const after = render(SNAP, ['notices'], undefined, withProps2, undefined, hooks[9])
+  assert.ok(!flat(after).includes('bbbb0000'), 'dismissed row stays out of the bell')
+
+  // A newer completion is a new turn: the session comes back on its own.
+  const newer = new Map([[UNREAD, { running: false, completionUnread: true, completionAt: stamp + 5000 }]])
+  const revived = render(SNAP, ['notices'], undefined, { useSessionStatus: () => newer, useSessions: withProps2.useSessions }, undefined, hooks[9])
+  assert.ok(flat(revived).includes('bbbb0000'), 'a newer completion revives the notice')
+  store.delete('agent-hud.dismiss.v1')
+  console.log('ok: × dismisses one completion, not the session')
+}
+
+// 6c-2) the dismissal is persisted, so a refresh does not resurrect the row
+{
+  store.set('agent-hud.dismiss.v1', JSON.stringify({ [UNREAD]: 1792390000000, bogus: 'x', zero: 0 }))
+  const props3 = { useSessionStatus: () => new Map([[UNREAD, { running: false, completionUnread: true, completionAt: 1792390000000 }]]), useSessions: () => ({ ids: [], byId: {}, projectionsBySession: {} }) }
+  const s = flat(render(SNAP, ['notices'], undefined, props3))
+  assert.ok(!s.includes('bbbb0000'), 'a stored dismissal survives a reload')
+
+  const revived = render(SNAP, ['notices'], undefined, { useSessionStatus: () => new Map([[UNREAD, { running: false, completionUnread: true, completionAt: 1792390000001 }]]), useSessions: props3.useSessions })
+  assert.ok(flat(revived).includes('bbbb0000'), 'and expires on the next completion')
+  store.delete('agent-hud.dismiss.v1')
+  console.log('ok: dismissal round-trips through localStorage')
+}
+
+// 6d) clear-all sweeps informational notices but never an approval
+{
+  store.delete('agent-hud.dismiss.v1')
+  const stamp = 1792390000000
+  const mixed = new Map([
+    [CUR, { running: true }],
+    [APPROVAL, {
+      running: false,
+      pendingInteraction: { kind: 'approval', answerable: true, toolName: 'bash', reason: 'rm', answer: async () => {} },
+    }],
+    [UNREAD, { running: false, completionUnread: true, completionAt: stamp }],
+  ])
+  const mp = { useSessionStatus: () => mixed, useSessions: () => ({ ids: [], byId: {}, projectionsBySession: {} }) }
+  const btn = findAll(render(SNAP, ['notices'], undefined, mp), (n) => n.type === 'button' && (n.kids || []).includes('clearAll'))[0]
+  assert.ok(btn, 'clear-all button rendered')
+  assert.equal(btn.props.title, 'clearAllExcept')
+  btn.props.onClick({ stopPropagation() {} })
+  const d = hooks[9]
+  assert.equal(d[UNREAD], stamp, 'unread dismissed')
+  // A running session carries no completion stamp yet, so it is stamped "now";
+  // what matters is that it is stamped at all, so its later completion revives it.
+  assert.ok(Number.isFinite(d[CUR]) && d[CUR] > 0, 'running session dismissed with a usable stamp')
+  assert.ok(!(APPROVAL in d), 'an approval is never bulk-dismissed')
+
+  const after = render(SNAP, ['notices'], undefined, mp, undefined, d)
+  assert.ok(flat(after).includes('approve'), 'the approval survives clear-all')
+  assert.ok(flat(after).includes('aaaa0000'), 'and is still actionable')
+  store.delete('agent-hud.dismiss.v1')
+  console.log('ok: clear-all spares approvals and questions')
 }
 
 // 7) auto-refresh off means no balance interval, only the 2s DSH poll + 1s price clock

@@ -6,6 +6,10 @@
 // notices (approval / question / running / unread) read from the framework's
 // useSessionStatus() slot prop. Approvals use the same PendingApproval object
 // as the conversation card, so both views stay in sync automatically.
+// A notice stops being a notice once you are looking at the session (the host
+// clears the unread flag) or once you wave it away with × / clear-all; both
+// manual paths record a local dismissal stamped with the completion they
+// covered, so the session returns to the bell on its next completion.
 window.__ModuleLoader__.load({
   id: '@local/agent-hud',
   factory(require) {
@@ -18,6 +22,7 @@ window.__ModuleLoader__.load({
     const BAL_KEY = 'agent-hud.balance.v1'
     const WARN_KEY = 'agent-hud.warn.v1'
     const RESET_KEY = 'agent-hud.reset.v1'
+    const DISMISS_KEY = 'agent-hud.dismiss.v1'
     const DSH_POLL_MS = 2000
 
     // DeepSeek API peak/off-peak rule, per the official pricing page (checked
@@ -55,6 +60,8 @@ window.__ModuleLoader__.load({
 .ahud-row b{font-weight:500;color:var(--dsw-alias-label-primary)}
 .ahud-item{display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--dsw-alias-border-l1)}
 .ahud-item .nm{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ahud-xrow{margin-left:auto;flex:0 0 auto;cursor:pointer;color:var(--dsw-alias-label-tertiary);padding:0 4px;font-size:13px;line-height:1}
+.ahud-xrow:hover{color:var(--dsw-alias-label-primary)}
 .ahud-kd{color:var(--dsw-alias-label-tertiary);white-space:nowrap}
 .ahud-err{color:var(--dsw-alias-state-error-primary);font-size:11px;padding-top:2px}
 .ahud-ctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap}
@@ -84,6 +91,7 @@ window.__ModuleLoader__.load({
         wallets: '钱包', updated: '更新于', warnOn: '低余额预警', yuan: '元',
         stale: '暂用上次数据', apiError: '错误', source: '来源',
         autoRefresh: '自动刷新', seconds: '秒', refreshNow: '立即刷新', refreshing: '刷新中…',
+        dismiss: '消除此条', clearAll: '全部清除', clearAllExcept: '清除全部（有回复/运行中）',
         resetStats: '重置统计', resetClear: '恢复 24h', since: '统计自',
         resetNeedsHost: '重启 DSH 后生效',
         pricing: '价格时段', peak: '峰时', offPeak: '谷时', fullPrice: '原价', halfPrice: '5 折',
@@ -102,6 +110,7 @@ window.__ModuleLoader__.load({
         wallets: 'wallets', updated: 'updated', warnOn: 'low balance alert', yuan: 'CNY',
         stale: 'showing last known', apiError: 'error', source: 'source',
         autoRefresh: 'auto refresh', seconds: 's', refreshNow: 'Refresh now', refreshing: 'refreshing…',
+        dismiss: 'Dismiss', clearAll: 'Clear all', clearAllExcept: 'Clear all (replies/running)',
         resetStats: 'Reset stats', resetClear: 'Restore 24h', since: 'counting since',
         resetNeedsHost: 'restart DSH to enable',
         pricing: 'Pricing', peak: 'Peak', offPeak: 'Off-peak', fullPrice: 'full price', halfPrice: '50% off',
@@ -151,6 +160,27 @@ window.__ModuleLoader__.load({
         if (Number.isFinite(at) && at > 0) return Math.min(at, Date.now())
       } catch {}
       return 0
+    }
+
+    // Hand-dismissed notices. `completionUnread` is a host-owned read-only flag:
+    // the Client half has no API to clear it, so a manual × records the session
+    // here instead. The value is the completion stamp that was dismissed, so a
+    // session comes back to the bell the moment it finishes a *new* turn and
+    // the host raises a fresh unread — dismissal covers one completion, not
+    // the session forever.
+    function loadDismiss() {
+      try {
+        const o = JSON.parse(localStorage.getItem(DISMISS_KEY))
+        if (o && typeof o === 'object' && !Array.isArray(o)) {
+          const out = {}
+          for (const k of Object.keys(o)) {
+            const v = Number(o[k])
+            if (Number.isFinite(v) && v > 0) out[k] = v
+          }
+          return out
+        }
+      } catch {}
+      return {}
     }
 
     function fmtTok(n) {
@@ -328,6 +358,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [now, setNow] = useState(() => Date.now())
       const [resetAt, setResetAt] = useState(loadReset)
+      const [dismiss, setDismiss] = useState(loadDismiss)
       const drag = useRef(null)
       const useStatus = props.useSessionStatus
       // Official callers always pass an explicit selector (the zero-arg path
@@ -423,6 +454,13 @@ window.__ModuleLoader__.load({
         } catch {}
       }, [resetAt])
 
+      useEffect(() => {
+        try {
+          if (Object.keys(dismiss).length) localStorage.setItem(DISMISS_KEY, JSON.stringify(dismiss))
+          else localStorage.removeItem(DISMISS_KEY)
+        } catch {}
+      }, [dismiss])
+
       // One-second clock for the price-period countdown; resync on return.
       useEffect(() => {
         const id = setInterval(() => setNow(Date.now()), 1000)
@@ -460,19 +498,50 @@ window.__ModuleLoader__.load({
         } catch {}
         return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sid))
       }
+      // A session is "the one you're looking at" only when the URL actually
+      // names it. Matching on a bare uuid substring used to hide a session the
+      // moment its flag was set, which is why opening one through the normal
+      // sidebar left the bell disagreeing with the page. Reading is tracked by
+      // the host: once the session is open and its unread flag is gone, it
+      // stops being a notice on its own — no HUD bookkeeping involved.
+      const isCurrent = (sid) => !!(curUuid && String(sid).includes(curUuid))
+      // Stamps a notice so a dismissal can expire on the next new completion.
+      const stampOf = (st) => {
+        const raw =
+          st && (st.completionAt || st.completedAt || st.lastActivityAt || st.updatedAt || st.startedAt)
+        const n = Number(raw)
+        return Number.isFinite(n) && n > 0 ? n : 0
+      }
       if (status && typeof status.forEach === 'function') {
         status.forEach((st, sid) => {
-          if (curUuid && sid.includes(curUuid)) return
           if (isSubagent(sid)) return
           const pi = st.pendingInteraction
-          if (pi && pi.kind === 'approval') notices.push({ sid, kind: 'approval', pi })
-          else if (pi) notices.push({ sid, kind: 'wait', pi })
-          else if (st.running) notices.push({ sid, kind: 'running' })
-          else if (st.completionUnread) notices.push({ sid, kind: 'unread' })
+          const cur = isCurrent(sid)
+          if (pi && pi.kind === 'approval') {
+            // An approval you are already looking at is not a pending action;
+            // it is answered in place. This is the one notice the URL filter
+            // can settle honestly, because being on the page means you can see
+            // and respond to it.
+            if (!cur) notices.push({ sid, kind: 'approval', pi, cur, stamp: stampOf(st) })
+          } else if (pi) {
+            if (!cur) notices.push({ sid, kind: 'wait', pi, cur, stamp: stampOf(st) })
+          } else if (st.running) {
+            notices.push({ sid, kind: 'running', stamp: stampOf(st) })
+          } else if (st.completionUnread && !cur) {
+            const stamp = stampOf(st)
+            // A manual × sticks only to the completion it dismissed: a newer
+            // stamp means the session finished another turn, so it belongs
+            // back in the bell.
+            if (dismiss[sid] === stamp && stamp > 0) return
+            notices.push({ sid, kind: 'unread', stamp })
+          }
         })
         const rank = { approval: 0, wait: 1, unread: 2, running: 3 }
         notices.sort((x, y) => rank[x.kind] - rank[y.kind])
       }
+      // Approvals and questions need a decision, so "clear all" leaves them be;
+      // only the informational kinds can be waved away in bulk.
+      const dismissible = notices.filter((n) => n.kind === 'unread' || n.kind === 'running')
       const alertCount = notices.filter((n) => n.kind !== 'running').length
       const pricing = pricingAt(now)
 
@@ -505,6 +574,18 @@ window.__ModuleLoader__.load({
         } catch (e) {
           console.warn('[agent-hud] answer failed', e)
         }
+      }
+      const dismissOne = (n) => {
+        // No usable stamp means we cannot tell this dismissal from the next
+        // one; fall back to "now" so it still expires rather than sticking.
+        setDismiss((d) => ({ ...d, [n.sid]: n.stamp || Date.now() }))
+      }
+      const dismissAll = () => {
+        setDismiss((d) => {
+          const next = { ...d }
+          for (const n of dismissible) next[n.sid] = n.stamp || Date.now()
+          return next
+        })
       }
 
       const togglePanel = (id) => {
@@ -813,6 +894,7 @@ window.__ModuleLoader__.load({
         const detail = n.kind === 'approval'
           ? (n.pi.toolName || '') + (n.pi.reason ? ' — ' + String(n.pi.reason).slice(0, 40) : '')
           : ''
+        const canDismiss = n.kind === 'unread' || n.kind === 'running'
         return h('div', { className: 'ahud-item ahud-nodrag', key: n.sid },
           h('span', { className: n.kind === 'running' || n.kind !== 'unread' ? 'ahud-dot' : 'ahud-dot st', style: { background: KIND_COLOR[n.kind] } }),
           h('span', {
@@ -831,12 +913,31 @@ window.__ModuleLoader__.load({
                 onClick: () => answer(n.pi, 'rejected'),
               }, t('deny')),
             ]
-            : h('button', { className: 'ahud-btn', onClick: () => jump(n.sid) }, t('jump')))
+            : h('button', { className: 'ahud-btn', onClick: () => jump(n.sid) }, t('jump')),
+          canDismiss
+            ? h('span', {
+              className: 'ahud-xrow', title: t('dismiss'),
+              onClick: (e) => {
+                e.stopPropagation()
+                dismissOne(n)
+              },
+            }, '×')
+            : null)
       }
 
       const noticePanel = h('div', { className: 'ahud-panel ahud-nodrag', key: 'p-notices' },
         h('div', { className: 'ahud-head' },
           h('span', { className: 'ahud-big' }, t('notices')),
+          dismissible.length
+            ? h('button', {
+              className: 'ahud-btn',
+              title: t('clearAllExcept'),
+              onClick: (e) => {
+                e.stopPropagation()
+                dismissAll()
+              },
+            }, t('clearAll'))
+            : null,
           h('span', {
             className: 'ahud-x',
             onClick: (e) => {
